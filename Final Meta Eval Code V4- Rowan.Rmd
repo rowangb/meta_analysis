@@ -1,0 +1,978 @@
+---
+title: "Meta Analysis Final Product V5"
+author: "Matt Dietz"
+date: "2/22/2022"
+output: html_document
+---
+
+This notebook contains finished code in an executable order. The user will need to update some chunks to access files/folders of the reports to be analyzed. Some final input is needed to filter the desired topics. 
+
+To Do:
+lemmatize key words to search for sentences
+put in the authors word score for comparisons
+edit group scoring to add/skip 0 group scores
+change final report score to reflect word's average score
+read KAVES and HIFIVE report and reflect on the ordinality & cardinality of scores
+research how others have used sentiment scores and what conclusions they are drawing
+allow reports to be searched for a universal list of keywords 
+extract some quantitative data from the report and try to analyze it
+run the key words through the acronyms list to find MM (mobile money)
+get the author's writing style by looking at their average sentence or word in a sentence score to compare across reports
+remove the word's simple average score from printing
+fix contradiciton length to be robust to more than just "no" = 1
+Change the text rating negate to be -2 if key_phrase does not have sentiment (as opposed to current sentiment) 
+
+
+
+Current Issues: 
+
+
+Variable Key:
+acronyms             list of data frames containing acronyms for each report
+afinn_edited         data frame of sentiment words that was curated for analyzing Final Eval Reports
+chapters             list of character vectors of reports that are split into predefined chapters
+chapters_findings    list of the findings chapter for each report
+contradictions       vector of words that contradicts/flips the meaning of a sentence
+countries            vector of countries 
+development_words    vector of words that need to be included for key words
+eval_questions       list of evaluation questions for each report
+key_grades           list of sentiment grades of sentences for each report
+key_sentences        list of character vectors containing sentences with key_words for each report
+key_subjects         vector of unique words that define all reports analyzed.
+key_words            list of target words for each report that defines its project
+groups               list of groups defined by the user for each report
+group_grades         list of grades for defined groups 
+indicators           list of data frame containing WDI indicators
+indicator_stem       list of data frame of WDI indicators split by word and "stemmed" 
+selected_key_words   list of key words selected by the user for each report analyzed
+tables_of_contents   list of data frames containing the table of contents for each report loaded in to R
+report_grades        list of grades for each report
+report_names         character vector of names of the reports loaded. always name followed by "report"
+reports              list of all reports loaded into R
+reports_files        vector of report names to load from local device
+USAID_stops          vector of common words or phrases appearing in reports that have no unique value
+
+ 
+
+Enter the file path to the location of documents inside "normalizePath"
+```{r setup}
+# knitr::opts_knit$set(root.dir = normalizePath("C:\\Users\\rgast\\OneDrive\\Downloads\\"))
+```
+
+Download and attach necessary libraries for text analysis. Also load any outside files,other than reports. 
+```{r Packages}
+required_packs <- c("pdftools","readxl","pdfsearch","tidyverse","data.table","stringr","tidytext","dplyr","igraph","NLP","tm", "quanteda", "ggraph", "topicmodels", "lasso2", "reshape2", "FSelector", "utils", "gtools", "qdap", "udpipe", "textstem", "SemNetCleaner", "xlsx","tabulizer","tokenizers")
+new_packs <- required_packs[!(required_packs %in% installed.packages()[,"Package"])]
+if(length(new_packs)) install.packages(new_packs)
+for (i in 1:length(required_packs)) {
+  sapply(required_packs[i],require, character.only = TRUE)
+}
+
+#Load the WDI Indicators and the countries list
+countries <- (read_excel("countries.xlsx", range = "C3:C243", col_names = "Countries"))
+countries = as.matrix(countries)
+indicators <- read_excel("WDISeries_indicators.xlsx",col_names = TRUE)
+ud_model <- udpipe_download_model(language = "english")
+ud_model <- udpipe_load_model(ud_model$file_model)
+```
+
+Import the PDF report files and sentiment dictionary. Edits to the dictionary can be made in Excel by adding a value to column 'new value'. The code below will apply that value if present or default to value. 
+NOTE: Must change working directory (wd) to align with your computer. 
+```{r Load Files}
+#enter the file names below
+new_report_path <- "C:\\Users\\rgast\\OneDrive\\Documents\\March 22 report.pdf"
+reports_files <- c("KAVES report.pdf", "HIFIVE report.pdf", new_report_path) 
+contradictions <- c("could not","would not","does not","will not","do not","were not","was not","did not", "no") 
+USAID_stops <- c("final", "usaidgov", "kaves", "evaluation","usaid.gov", "project","performance","government")
+development_words <- c("sustainability","diversification","competitiveness")
+
+
+#load the  customized sentiment dictionary
+afinn_edited <- as.data.frame(read_excel("Sentiment Dictionary.xlsx"))
+afinn_edited$`true value` <-  ifelse(is.na(afinn_edited$`new value`),afinn_edited$value, afinn_edited$`new value`)
+afinn_edited <- afinn_edited[,c("word","true value")]
+colnames(afinn_edited) <- c("word","value")
+
+```
+
+Create a book containing all reports. The reports will be character vectors with each element a page of a report. 
+```{r Book and Content Formation}
+reports <- list()       #a list of all reports
+
+report_names <- vector(mode = "character", length = length(reports_files))
+for (i in 1:length(reports_files))  {      #load each file into R separately 
+  name <- strsplit(reports_files[i],".",fixed = T)[[1]][1]    #create the name of reports from file
+  
+  if (grepl("\\", reports_files[i], fixed = TRUE)){
+   name <- strsplit(name, "\\", fixed = T)[[1]]
+   name <- tail(name, n=1)
+  }
+  
+  report_names[i] <- name
+  assign(name, pdf_text(reports_files[i]))     #assign the full report to the correct name
+  report <- list(pdf_text(reports_files[i]))
+  names(report) <- strsplit(reports_files[i],".",fixed = T)[[1]][1]
+  if (grepl("\\", reports_files[i], fixed = TRUE)){
+   name <- strsplit(name, "\\", fixed = T)[[1]]
+   names(report) <- tail(name, n=1)
+  }
+  reports <- append(reports, report)  
+  # ^add the report to the list of reports. each entry is a report
+}
+```
+
+Functions. Any and all functions built and used in this analysis are defined in this chunk. Depending on the version of output code some functions may not be used. 
+```{r Functions}
+#takes in 1 report and (1 or 0) for it to be formatted (lower case, white space removed). returns a table of contents. when searching for topics a formatted term (evaluation findings) may want to be used because the text was formatted but sometimes the raw term is needed (1.1 EVALUATION FINDINGS)
+create_contents <- function(report, formatted) {
+  chapters <- list()
+  page_contents <- which(grepl("CONTENTS",report))
+  contents <- (strsplit(report[page_contents],split = "\n"))  #create the contents list
+  contents[[1]] <- contents[[1]][lapply(contents[[1]],nchar)>0]
+  table_contents <- data.frame(0,0)
+  colnames(table_contents) <- c("Chapter", "Page")
+  i <- 1
+  check <- TRUE
+  while(i < lengths(contents)) {
+    new_content = data.frame(0,0)
+    colnames(new_content) <- c("Chapter", "Page")
+    if(check == TRUE) {
+      if(is.na(as.numeric(trimws((tail(str_split(contents[[1]][i],"\\.")[[1]],n=1)))))) {
+          z <- i
+      }else{check <- FALSE}
+      }
+    if (as.numeric(trimws((tail(str_split(contents[[1]][i],"\\.")[[1]],n=1)))) %in% 1:2000) {
+      new_content[1,2] <- as.numeric(trimws((tail(str_split(contents[[1]][i],"\\.")[[1]],n=1)))) 
+      } else { new_content[1,2] <- as.numeric(roman2int(last(str_split(contents[[1]][i], " ")[[1]])))}
+    new_content[1,1] <- contents[[1]][i] %>% substr(1,nchar(contents[[1]][i])-3) %>% str_remove_all("\\.") %>% trimws(which = "right")
+    if(!new_content[1,1] == "") table_contents = rbind(table_contents,new_content)
+    i = i+1
+  }
+  #check if contents page rolls over to the next page
+  if(!any(unlist(lapply(toupper(table_contents[,1]),grepl,report[page_contents+1])))) {
+      contents <- (strsplit(report[page_contents+1],split = "\n"))  #create the contents list
+      contents[[1]] <- contents[[1]][lapply(contents[[1]],nchar)>0]
+      i <- 1
+    check <- TRUE
+    while(i < lengths(contents)) {
+      new_content = data.frame(0,0)
+      colnames(new_content) <- c("Chapter", "Page")
+      if(check == TRUE) {
+        if(is.na(as.numeric(trimws((tail(str_split(contents[[1]][i],"\\.")[[1]],n=1)))))) {
+            z <- i
+        }else{check <- FALSE}
+        }
+      if (as.numeric(trimws((tail(str_split(contents[[1]][i],"\\.")[[1]],n=1)))) %in% 1:2000) {
+        new_content[1,2] <- as.numeric(trimws((tail(str_split(contents[[1]][i],"\\.")[[1]],n=1)))) 
+        } else { new_content[1,2] <- as.numeric(roman2int(last(str_split(contents[[1]][i], " ")[[1]])))}
+      new_content[1,1] <- contents[[1]][i] %>% substr(1,nchar(contents[[1]][i])-3) %>% str_remove_all("\\.") %>% trimws(which = "right")
+      if(!new_content[1,1] == "") table_contents = rbind(table_contents,new_content)
+      i = i+1
+    }
+  }
+  #remove extra parts that are "scraps"
+  table_contents <- table_contents[-(1:2),]
+  a <- table_contents[z,1]
+  b <- which(startsWith(gsub("\\s+", " ", gsub("\n", " ", removePunctuation(report))),toupper(gsub("\\s+", " ", a))))
+  table_contents[,2] <- table_contents[,2] + (b - table_contents[z,2]) 
+  i <- 1   #table_contents[head(which(table_contents[,2] != "NA"), n = 1),2])
+  recent <- 1
+  while (i < z) {
+    if(length(which(startsWith(gsub("\\s+", " ", gsub("\n", " ", removePunctuation(report))),toupper(gsub("\\s+", " ", table_contents[i,1]))))) == 1) {
+    table_contents[i,2] <- which(startsWith(gsub("\\s+", " ", gsub("\n", " ", removePunctuation(report))),toupper(gsub("\\s+", " ", table_contents[i,1]))))
+    recent <- table_contents[i,2]
+    }else {table_contents[i,2] <- recent}
+    i <- i+1
+  }
+  if(formatted == 1) table_contents[,1] <- table_contents[,1] %>% trimws() %>% tolower()
+  
+  rownames(table_contents) <- 1:nrow(table_contents)
+  return(table_contents)
+}
+
+#divides a report into its chapters using its table of contents. the output is a list of chapters. chapters are selected using the USAID rubric and should contain all info from each report without overlap. 
+create_chapters <- function(reports) {
+  book <- list()
+  table_of_contents <- create_contents(reports,1)
+  
+  #Executive Summary.  It always begins on a new page and finishes on its own page
+    exec_sum_pg <- heading_search(table_of_contents[,1],"executive summary")$line_num
+    chap_exec_sum <- as.character(reports[table_of_contents[exec_sum_pg,2]:(table_of_contents[last(which(grepl("evaluation purpose", table_of_contents[,1]) & grepl("questions", table_of_contents[,1]))),2]-1)])
+  
+  #Evaluation Purpose and Evaluation Questions.  starts on new page
+  eval_page = last(which(grepl("evaluation purpose", table_of_contents[,1]) & grepl("questions", table_of_contents[,1])))
+  chap_eval_questions <- reports[table_of_contents[eval_page,2]:table_of_contents[next_num(eval_page,which(grepl("background", table_of_contents[,1]))),2]]
+  
+  chap_eval_questions <- str_split(chap_eval_questions, trimws(removeNumbers(toupper(table_of_contents[next_num(eval_page,which(grepl("background", table_of_contents[,1]))),1]))))
+  chap_eval_questions <- sapply(chap_eval_questions, "[[", 1)
+  
+  #Background
+  background_pg <- next_num(eval_page,which(grepl("background", table_of_contents[,1])))
+  chap_background <- reports[table_of_contents[background_pg,2]:table_of_contents[next_num(background_pg,which(grepl("methods|methodology",table_of_contents[,1]))),2]]
+  
+  chap_background[1] <- as.character(str_split(chap_background[1],trimws(removeNumbers(toupper(table_of_contents[next_num(eval_page,which(grepl("background", table_of_contents[,1]))),1]))))[[1]][2])
+  #chap_background[1] <- as.character(str_split(chap_background[[1]],"PROJECT BACKGROUND\n")[[1]][2])
+  
+  chap_background[length(chap_background)] <- str_split(gsub("\n"," ",chap_background[length(chap_background)]), trimws(removeNumbers(toupper(table_of_contents[next_num(background_pg,which(grepl("methods|methodology", table_of_contents[,1]))),1]))))[[1]][1]
+  
+  #Methods and Limitations
+  method_pg <- next_num(background_pg,which(grepl("methods|methodology", table_of_contents[,1])))
+  chap_methods_limitations <- reports[table_of_contents[method_pg,2]:table_of_contents[next_num(method_pg,which(grepl("finding|result", table_of_contents[,1]))),2]]
+   chap_methods_limitations[1] <- as.character(str_split(gsub("\n"," ",chap_methods_limitations[1]),trimws(removeNumbers(toupper(table_of_contents[next_num(background_pg,which(grepl("methods|methodology", table_of_contents[,1]))),1]))))[[1]][2])
+  chap_methods_limitations[length(chap_methods_limitations)] <- as.character(str_split(gsub("\n"," ",chap_methods_limitations[length(chap_methods_limitations)]),trimws(removeNumbers(toupper(table_of_contents[next_num(method_pg,which(grepl("findings|results", table_of_contents[,1]))),1]))))[[1]][1])
+  
+  #Findings
+  finding_pg <- next_num(method_pg,which(grepl("finding|result", table_of_contents[,1])))
+  chap_findings <- reports[table_of_contents[finding_pg,2]:table_of_contents[next_num(finding_pg,which(grepl("conclusion", table_of_contents[,1]))),2]]
+  #Chop leading and trailing chapters' text
+  if(length(as.character(str_split(chap_findings[[1]],toupper(table_of_contents[last(which(grepl("finding|result", table_of_contents[,1]))),1]))[[1]])) > 1) {
+    chap_findings[1] <- as.character(str_split(chap_findings[[1]],toupper(table_of_contents[last(which(grepl("finding|result", table_of_contents[,1]))),1]))[[1]][2])
+  }
+  chap_findings[length(chap_findings)] <- as.character(str_split(chap_findings[[length(chap_findings)]],removeNumbers(toupper(table_of_contents[next_num(finding_pg,which(grepl("conclusion",table_of_contents[,1]))),1])))[[1]][1])
+
+  #Conclusions
+  concl_pg <- next_num(finding_pg,which(grepl("conclusion", table_of_contents[,1])))
+  if(concl_pg == next_num(finding_pg,which(grepl("recommendation", table_of_contents[,1])))) {
+    next_chap <- next_num(concl_pg,which(grepl("annex|appendix", table_of_contents[,1])))
+    same <- TRUE
+  }else {
+    next_chap <- next_num(concl_pg,which(grepl("recommendation", table_of_contents[,1])))
+    same <- FALSE
+  }
+  chap_conclusions <- reports[table_of_contents[concl_pg,2]:table_of_contents[next_chap,2]]
+  #Chop leading and trailing chapters' text
+  chap_conclusions[1] <- as.character(str_split(chap_conclusions[1],removeNumbers(toupper(table_of_contents[next_num(finding_pg,which(grepl("conclusion", table_of_contents[,1]))),1])))[[1]][2])
+  if(!same) {
+  chap_conclusions[length(chap_conclusions)] <- as.character(str_split(chap_conclusions[length(chap_conclusions)],removeNumbers(toupper(table_of_contents[next_num(finding_pg,which(grepl("recommendation", table_of_contents[,1]))),1])))[[1]][1])
+}else chap_conclusions[length(chap_conclusions)] <- as.character(str_split(chap_conclusions[length(chap_conclusions)],removeNumbers(toupper(table_of_contents[next_num(finding_pg,which(grepl("annex|appendix", table_of_contents[,1]))),1])))[[1]][1])
+  
+  #Recommendations 
+  recommend_pg <- next_num(finding_pg,which(grepl("recommendation", table_of_contents[,1])))
+  chap_recommend <- reports[table_of_contents[recommend_pg,2]:table_of_contents[next_num(recommend_pg,which(grepl("annex|appendix", table_of_contents[,1]))),2]]
+  #Chop leading and trailing chapters' text
+  chap_recommend[1] <- as.character(str_split(chap_recommend[[1]],removeNumbers(toupper(table_of_contents[next_num(finding_pg,which(grepl("recommendation", table_of_contents[,1]))),1])))[[1]][2])
+  chap_recommend[length(chap_recommend)] <- as.character(str_split(chap_recommend[[length(chap_recommend)]],toupper(table_of_contents[next_num(recommend_pg,which(grepl("annex|appendix", table_of_contents[,1]))),1]))[[1]][1])
+  
+  #Annexes   this is the final section of the report and will carry until the report ends
+  annex_pg <- next_num(recommend_pg,which(grepl("annex|appendix", table_of_contents[,1])))
+  chap_annex <- reports[table_of_contents[annex_pg,2]:length(reports)]
+  
+  #annex statement of work
+  sow_pg <- first(which(grepl("evaluation statement of work|evaluation scope of work",table_of_contents[,1])))
+  chap_sow <- reports[table_of_contents[sow_pg,2]:(table_of_contents[sow_pg+1,2]-1)]
+  
+  #put it all together
+  book <- list("executive summary" = chap_exec_sum, "evaluation purpose and questions" = chap_eval_questions, "background" = chap_background, "methods and limitations" = chap_methods_limitations, "findings" = chap_findings, "conclusions" = chap_conclusions, "recommendations" = chap_recommend, "annex" = chap_annex, "statement of work" = chap_sow)
+  return(book)
+}
+
+#used to combine words into one character
+word_combine <- function(words) {
+  part <- paste(words[1],words[2], sep = " ")
+  if(length(words) > 2) {
+    for (i in 1:(length(words)-2)) {
+      part <- paste(part,words[i+2], sep = " ")
+    }
+  }
+  return(part)
+}
+
+#takes in a vector of characters (pages) that is the findings chapter and splits them into sections by eval question
+finding_split <- function(findings_chapter) {
+  findings_by_question <- list()
+  number <- length(which(lengths(str_split(findings_chapter, "EVALUATION QUESTION")) > 1))
+  spot <- which(lengths(str_split(findings_chapter, "EVALUATION QUESTION")) > 1)
+  for (i in 1:number) {
+    name <- paste("Finding",i,sep = " ")
+    if (i < number) {
+    findings_by_question[[name]] <- unlist(str_split(findings_chapter, "EVALUATION QUESTION"))[(spot[i]+i):(spot[i+1]+i)]
+    }else { 
+      a <- length(unlist(str_split(findings_chapter, "EVALUATION QUESTION")))
+      findings_by_question[[name]] <- unlist(str_split(findings_chapter, "EVALUATION QUESTION"))[(spot[i]+i):a]
+  }
+  }
+  return(findings_by_question)
+}
+#split_findings <- finding_split(chapters[[1]]$findings)
+
+#Selects sentences from a text based on target words/phrases (without table removal)
+sentence_extraction_ <- function(sentances, target_indicators,indicator) {
+  part <- tibble(words = sentances)
+  parted <- unnest_sentences(part,phrase,words)
+  parted <- tolower(parted$phrase)
+  parted_raw <- parted
+  if(indicator == 1) {
+    t_indicators <- lemmatize_strings(target_indicators)
+    parted <- unlist(lapply(parted_raw,lemmatize_strings))
+  }else if(indicator == 2) {
+    t_indicators <- stem_strings(target_indicators)
+    parted <- unlist(lapply(parted_raw,stem_strings))
+  }else {
+    t_indicators <- (target_indicators)
+    parted <- parted_raw
+  }
+    
+  relevant <- list()
+  for (i in 1:length(target_indicators)) {
+    total_sentences <- parted_raw[c(which(grepl(t_indicators[i],parted)))]
+    q_sentences <- total_sentences[-which(grepl("\\?",total_sentences))]
+    
+    
+    if(length(q_sentences) > 0) {
+      relevant[[target_indicators[i]]] <- q_sentences
+    }else {
+      relevant[[target_indicators[i]]] <- total_sentences
+    }
+  }
+  return(relevant)
+} 
+
+### need this for removing all tables 
+sentence_extraction <- function(sentances, target_indicators,indicator, table_remove){
+  part <- tibble(words = sentances)
+  parted <- unnest_sentences(part,phrase,words)
+  parted <- tolower(parted$phrase)
+  parted_raw <- parted
+  if(indicator == 1) {
+    t_indicators <- lemmatize_strings(target_indicators)
+    parted <- unlist(lapply(parted_raw,lemmatize_strings))
+  }else if(indicator == 2) {
+    t_indicators <- stem_strings(target_indicators)
+    parted <- unlist(lapply(parted_raw,stem_strings))
+  }else {
+    t_indicators <- (target_indicators)
+    parted <- parted_raw
+  }
+    
+  relevant <- list()
+  for (i in 1:length(target_indicators)) {
+    total_sentences <- parted_raw[c(which(grepl(t_indicators[i],parted)))]
+    total_sentences <- setdiff(total_sentences, table_remove)
+    q_sentences <- total_sentences[-which(grepl("\\?",total_sentences))]
+    
+    
+    if(length(q_sentences) > 0) {
+      relevant[[target_indicators[i]]] <- q_sentences
+    }else {
+      relevant[[target_indicators[i]]] <- total_sentences
+    }
+  }
+  return(relevant)
+}
+
+#takes in a list and returns the sentiment of each element overall
+finding_rating <- function(findings) {
+  gut_reactions <- matrix(0, nrow = length(findings), ncol = 2)
+  colnames(gut_reactions) <- c("Positive Score", "Negative Score")
+  a <- get_sentiments(lexicon = "bing")
+  for (i in 1:length(findings)) {
+    finding_1_words <- tibble(page = 1:length(findings[[i]]),words = findings[[i]])
+    tidy_finding_1_words <- unnest_tokens(finding_1_words,word,words)
+    b <- inner_join(tidy_finding_1_words, a) %>% count(word,sentiment,sort = T)
+    c <- table(b$sentiment, b$n)
+    d <- colSums(as.numeric(rownames(t(c))) * t(c))
+    gut_reactions[i,] <- d
+    }
+  print(gut_reactions)
+}
+
+
+
+#takes in a character vector and sentiment bag to find sentiment scores
+text_rating <- function(text,sent_bag,contras) {
+  a <- sent_bag
+  count_neg <- 0
+  count_pos <- 0
+  if (length(table(sent_bag[,2]))==2) #this shows sentiment is binary
+    {
+    gut_reactions <- matrix(0, nrow = length(text), ncol = 2)
+    colnames(gut_reactions) <- c("Negative Score", "Positive Score")
+  if(length(text) != 0) {
+    for (i in 1:length(text)) {
+      finding_1_words <- tibble(sentence = i,words = text[i])
+      tidy_finding_1_words <- unnest_tokens(finding_1_words,word,words)
+      b <- inner_join(tidy_finding_1_words, a) %>% count(word,sentiment,sort = T)
+      c <- table(b$sentiment, b$n)
+      d <- colSums(as.numeric(rownames(t(c))) * t(c))
+      if(!is_empty(d)){
+        if("negative" %in% names(d)) {  gut_reactions[i,1] <- d["negative"]
+          }else gut_reactions[i,1] <- 0
+        if("positive" %in% names(d)) {
+          gut_reactions[i,2] <- d["positive"]
+          }else gut_reactions[i,2] <- 0
+        }else gut_reactions[i,] <- 0
+    }
+    }else gut_reactions <- c("NA")
+  }else  #sentiment bag is not binary scores
+    {
+      gut_reactions <- matrix(0, nrow = length(text), ncol = 1)
+      colnames(gut_reactions) <- c("Score")
+     # is this right place for bracket?
+
+  if(length(text) != 0) {
+    for (i in 1:length(text)) {
+      begin <- 1
+      end <- 1
+      
+      for (f in 1:4){
+      potential_targetf <- paste0("([^\\s]+\\s+){",f,"}",contras,"(\\s+[^\\s]+){1}")
+      potential_key_phrase <- unlist(str_extract_all(text[i],potential_targetf))
+      
+        if (!is_empty(potential_key_phrase)){
+        begin <- f
+      }
+      }
+      
+      for (l in 1:4){
+      potential_targetl <- paste0("([^\\s]+\\s+){",begin,"}",contras,"(\\s+[^\\s]+){",l,"}")
+      key_phrase <- unlist(str_extract_all(text[i],potential_targetl))
+        if (!is_empty(potential_key_phrase)) {
+        end <- l
+      }
+      }
+      
+      targets <- paste0("([^\\s]+\\s+){",begin,"}",contras,"(\\s+[^\\s]+){",end,"}")
+      
+      key_phrase <- unlist(str_extract_all(text[i],targets)) ## finds all matches in text,
+
+      # multiplier <- 1
+      # if(!is_empty(key_phrase)){
+      # print("keyphrase:")
+      # print(key_phrase)  
+      # }
+      # if(any(sapply(contras,grepl,text[i])) == TRUE) multiplier <- -1
+      finding_1_words <- tibble(sentence = i,words = text[i]) ## creates dataframe(tibble)
+      tidy_finding_1_words <- unnest_tokens(finding_1_words,word,words) ## tokenizes both word and words of the text
+      b <- inner_join(tidy_finding_1_words, a) %>% count(word,value,sort = T) ### what is this
+      counter <- 0
+      if(!is_empty(key_phrase)) {
+        for(num_phrase in 1:length(key_phrase)){
+
+        phrase_split <- unlist(str_split(key_phrase[[num_phrase]]," "))
+        
+        for (num in 1:begin){
+            if(phrase_split[num] %in% b$word) {
+              b[which(b$word == phrase_split[num]),2] <- b[which(b$word == phrase_split[num]),2] * -1
+              counter<- 1
+            }
+    
+        }
+        
+        contra_length <- 2
+        if (" no " %in% key_phrase){
+          contra_length <- 1
+        }
+        begin_ <- begin + contra_length
+        end_ <- end + begin_
+        
+          for (num in begin_:end_){
+            if(phrase_split[num] %in% b$word) {
+              b[which(b$word == phrase_split[num]),2] <- b[which(b$word == phrase_split[num]),2] * -1
+              counter<- 1
+            }
+          }
+      }
+}
+
+      c <- table(b$value, b$n)
+      d <- colSums(as.numeric(rownames(t(c))) * t(c))
+      d <- sum(as.numeric(names(d))*d)
+      # if(counter==1){
+      #   print(text[i])
+      # }
+
+      if(!is_empty(d)){ gut_reactions[i,] <- d#*multiplier
+      count_neg <- count_neg + sum(c[as.numeric(rownames(c)) < 0,])
+      count_pos <- count_pos + sum(c[as.numeric(rownames(c)) > 0,])
+      }else gut_reactions[i] <- 0
+      # if (gut_reactions[i]==0 & counter==1){
+      #   gut_reactions[i] <- -2
+      # }
+      if (!is_empty(key_phrase) & d == 0){
+        # print(text[i])
+        gut_reactions[i] <- -2
+      }
+    }
+    rownames(gut_reactions) <- paste("sentence",1:length(text))
+    net_score <- sum(gut_reactions)
+    gut_reactions <- rbind(gut_reactions,net_score)
+    gut_reactions <- rbind(gut_reactions,count_neg)
+    gut_reactions <- rbind(gut_reactions,count_pos)
+
+  }else gut_reactions <- c("NA")
+    }
+    return(gut_reactions)
+}
+
+#takes in a list of text with sentences containing key_words and the sentiment bag to be used and returns the sentiment of each sentence per key_word per list
+find_sentiments <- function(list_sentences,sent,contra) {
+  found_all_sent <- list()
+  for (i in 1:length(list_sentences)) {
+    word_rating <- list()
+    for (j in 1:length(list_sentences[[1]])) {
+      name_word <- names(list_sentences[[i]][j])
+      new_rating <- as.data.frame(text_rating(list_sentences[[i]][[j]],sent,contra))
+      if(new_rating == "NA") {
+        new_rating <- "Word not in chapter"
+      }
+      names(new_rating) <- paste(names(list_sentences[[i]][j])," Sentiment Score")
+      word_rating <- append(word_rating,list(new_rating))
+    }
+    names(word_rating) <- names(list_sentences[[1]])
+    found_all_sent <- append(found_all_sent,list(word_rating))
+  }
+  #names(found_all_sent) <- names(key_sentences)
+  return(found_all_sent)
+}
+
+sentiment_correction <- function(scores,sentences) {
+  
+}
+
+#net score is based on the dictionary used. calculates average score of a sentence, which varies based on the authors writing style. 
+#takes in a list of scores (a list of list of scores)
+#net score is based on the dictionary used. afinn scored words from -5 to 5
+#Raw Score is the sum of sentiment for a word. Weighted Average Score is the raw score divided by number of sentences that a word appears. Word's Average Score is the raw score divided by the number of words with sentiment found for a given key word. Word's Simple Average Score is the average of the average score of a word with sentiment. When not splitting Findings into sections/evaluation questions Word's average score and word's simple average score will be equal. 
+grader <- function(scores, eval_questions)  {
+  chapter_score <- data.frame()
+  word_score <- data.frame()
+  
+  for (i in 1:length(scores)) {   #first get the score for each findings chapter by eval question
+    chap_score <- c(0,0,0)
+    temp <- scores[[i]][!unlist(lapply(scores[[i]],is.character))]
+    chap_word_score <- vector(mode = "numeric",length = length(temp))
+    for (j in 1:length(temp)) {
+      chap_word_score <- unlist(lapply(temp[j],function(x)x["net_score",])) / (nrow(temp[[j]])-3)
+    }
+    chap_score[1] <- sum(unlist(lapply(temp,function(x)x["net_score",])))
+    chap_score[2] <- chap_score[1] / (sum(unlist(lapply(temp,nrow))) - (3 *length(temp)))
+    chap_score[3] <- mean(chap_word_score)
+    chapter_score <- rbind(chapter_score,chap_score)
+  }
+  for (i in 1:length(scores[[1]])) {  #get the score for each key component across findings chapters
+    w_score <- c(0,0,0,0)
+    count <- 0
+    w_count <- 0
+    w_avg <- 0
+    comp <- lapply(scores,'[[',i)
+    for (j in 1:length(scores)) {
+      if(!is.character(comp[[j]])) {
+        w_score[1] <- w_score[1] + comp[[j]]["net_score",]
+        count <- count + (nrow(comp[[j]])-3)
+        w_count <- w_count + comp[[j]]["count_neg",] + comp[[j]]["count_pos",] 
+        if((!comp[[j]]["count_neg",] == 0) | (!comp[[j]]["count_pos",] == 0)) w_avg <- w_avg + ((comp[[j]]["net_score",] / (comp[[j]]["count_neg",] + comp[[j]]["count_pos",])) / length(scores))
+      }
+    }
+    w_score[2] <- w_score[1]/count
+    w_score[3] <- w_score[1] / w_count
+    w_score[4] <- w_avg
+    word_score <- rbind(word_score,w_score)
+  }
+  #create the final grade
+  goal_weights <- vector(mode = "numeric",length = length(scores))
+  # 
+  for (i in 1:length(goal_weights)) { #for each evaluation question chapter in findings
+    goal_weights[i] <- (chapter_score[i,1] / chapter_score[i,2]) / sum(chapter_score[,1]/chapter_score[,2])
+    }
+  #create the final scorecard
+  overall_score <- sum(goal_weights*chapter_score[,2])
+
+  rownames(word_score) <- names(scores[[1]])
+  colnames(word_score) <- c("Raw Score","Weighted Average Score","Word's Average Score","Word's Simple Average Score")
+  rownames(chapter_score) <- names(scores)
+  names(chapter_score) <- c("Raw Score","Weighted Average Score", "Simple Average")
+  grades <- list("Target Word Scores" = word_score,"Evaluation Findings Scores" = chapter_score,"Final Report Score" = overall_score)
+  return(grades)
+  }
+#### Rowan look above here for changes matt may have made
+
+
+#takes in a list of reports and returns the evaluation questions for each report in a list. There can be some extra text extracted that is not filtered
+get_qs <- function(report_chapters) {
+  questions <- list()
+  for (i in 1:length(report_chapters)) {
+     qs <- unlist(str_split(report_chapters[[i]]$'evaluation purpose and questions',"EVALUATION QUESTIONS"))[-(1:2)]
+     qs <- qs[grepl("\\?",qs)]
+     questions[[paste("report",i)]] <- qs
+      }
+  return(questions)
+}
+
+#Inputs are scores of key words and a list of groups where each group has the words included in that group
+#takes in a list of grades and list of groups & outputs the grades of the group
+group_grader <- function(final_scores,groups) {    
+  #first score the groups
+  groups_score <- list()
+  for (i in 1:length(groups)) {
+    grouping_score <- vector(mode = "numeric",length = length(groups[[i]]))
+    for (j in 1:length(groups[[i]])) {      #score each group
+      grouping_score[j] <- final_scores[[1]][groups[[i]][j],3]
+    }
+    groups_score[[word_combine(groups[[i]])]] <- mean(grouping_score)
+  }
+  return(groups_score)
+}
+
+#given a starting number and a sorted vector of numbers this returns the next number greater than the starting. It is used for indexing
+next_num <- function(base,options) {
+  numbs <- sort(c(base,options))
+  next_num <- numbs[first(which(numbs > base))]
+  return(next_num)
+}
+
+#This function allows the user to select which key words they want to keep my entering T or F for a word.
+key_word_selector <- function(words) {
+  final_key_words <- list()
+  for (j in 1:length(words)) {
+    print(paste("Key Words for",names(words)[j]))
+    print(words[[j]])
+    selector <- vector(mode = "logical",length = length(words[[j]]))
+    for (i in 1:length(words[[j]])) {
+      cat(paste("\n",words[[j]][i]))
+      selector[i] <- as.logical(toupper(readline(prompt = "Enter t to keep a word ")))
+    }
+    final_key_words[[names(words)[j]]] <- words[[j]][selector]
+    print(paste("These are the selected key words for the ",names(words)[j]))
+    print(final_key_words[[names(words)[j]]])
+    choice <- as.logical(toupper(readline(prompt = "Enter t if you want to create a key phrase? ")))
+     if(choice) {
+       word_phrase <- vector(mode = "logical",length = length(final_key_words[[j]])) 
+    for (k in 1:length(final_key_words[[j]])) {
+      cat(paste("\n",final_key_words[[j]][k]))
+      word_phrase[k] <- as.logical(toupper(readline(prompt = "Enter t to pair this word ")))
+    }
+       print(word_combine(final_key_words[[names(words)[j]]][word_phrase]))
+       flip <- as.logical(toupper(readline(prompt = "Is this the order of the key phrase you want? ")))
+       if(!flip) {
+         new_phrase <- word_combine(c(last(final_key_words[[names(words)[j]]][word_phrase]), first(final_key_words[[names(words)[j]]][word_phrase])))
+       }else new_phrase <- word_combine(final_key_words[[names(words)[j]]][word_phrase])
+       final_key_words[[names(words)[j]]] <- c(final_key_words[[names(words)[j]]],new_phrase)
+     }
+  }
+  return(final_key_words)
+}
+
+#Allows the user to group keywords however they choose
+grouper <- function (words) {
+  groups <- list()
+  for (j in 1:length(words)) {
+      cat(paste("\nHere are the selected keywords for",names(words[j]),"\n"))
+      print(words[[j]])
+      num_groups <- readline(prompt = " How many groups would you like to create? ")
+      for (i in 1:num_groups) {
+        cat("Assigning group ",i)
+        g <- vector(mode = "logical",length = length(words[[j]]))
+        for (k in 1:length(words[[j]])) {
+          cat(paste("\n",words[[j]][k]))
+          g[k] <- as.logical(toupper(readline(prompt = "Enter t to select the word in this group ")))
+          group <- list(words[[j]][g])
+          
+        }
+        groups[[names(words)[j]]] <- append(groups[[names(words)[j]]],group) 
+      }
+  }
+  return(groups)
+}
+
+table_extract_char <- function(file){
+
+  tables_character <- extract_tables(file, output = "character")
+  tables_rmv_trial <- str_replace_all(tables_character,'\t', ' ')
+  tables_rmv_trial <- str_replace_all(tables_rmv_trial, '%', ' ')
+  tables_character <- str_replace_all(tables_rmv_trial, '\n', ' ')
+  tables_character <- tokenize_words(tables_character)
+  return(tables_character)
+}
+
+table_remover <- function(key_sentences_for_report, tables_char, threshold){
+  list_to_remove <- c()
+    
+    for(keyword in 1: length(key_sentences_for_report)){
+      keyword_num <- keyword
+      keyword <- tokenize_words(key_sentences_for_report[[keyword]])
+      
+      if (length(keyword) != 0){
+        for(sentence in 1:length(keyword)){
+        
+          for (sentence1 in 1:length(tables_char)){
+            word_num <- length (tables_char[[sentence1]])
+            similarity_threshold <- word_num *(threshold)
+            num_matches <- which(tables_char[[sentence1]] %in% keyword[[sentence]])
+            
+            
+            if(length(num_matches) > similarity_threshold){
+              
+              list_to_remove <- c(list_to_remove, key_sentences_for_report[[keyword_num]][[sentence]])
+
+            }
+            
+          }
+        }
+      }
+    }
+  return(list_to_remove)
+  }
+```
+
+Create all chapters first
+```{r Creates chapters from Tb_C}
+  
+tables_of_contents <- list()    #a list of table contents for each report
+acronyms <- list()
+chapters <- list()
+eval_questions <- list()
+#takes a report (a list) as input and creates table of contents
+for (i in 1:length(reports[[3]])) {
+  tables_of_contents[[paste("Tb_C", report_names[i])]] <- (create_contents(reports[[i]],1))
+  first_acr <- which(grepl("ACRONYMS",reports[[i]]) | grepl("ABBREVIATIONS",reports[[i]]))
+  final_acr <- which(grepl("EXECUTIVE SUMMARY",reports[[i]]))
+  first_acr <- tail(first_acr, n=1)
+  final_acr <- tail(final_acr, n=1)
+  print(first_acr)
+  print(final_acr)
+  acr_pages <- str_split(reports[[i]][first_acr:final_acr],"\n")
+  acronym <- data.frame()
+  for(j in 1:length(acr_pages)) {
+    acs <- data.frame()
+    for (k in 1:length(acr_pages[[j]])) {
+      words <- str_split(acr_pages[[j]],"\\s+")[[k]][-1]
+      acs[k,1] <- str_split(acr_pages[[j]],"\\s+")[[k]][1]
+      acs[k,2] <- word_combine(words)
+    }
+    acronym <- rbind(acronym, acs[acs[,1] != "" & acs[,2] != "NA NA",])
+  }
+  acronyms[[report_names[[i]]]] <- acronym
+  
+  #create a list of reports divided into chapters
+  chapters[[report_names[i]]] <- create_chapters(reports[[i]])
+  eval_questions[[report_names[[i]]]] <- get_qs(chapters)
+}
+
+```
+
+Locate and input the evaluation questions. 
+```{r Eval questions}
+
+
+```
+
+Findings. Function for removing each finding according to its evaluation question. Sort of repetitive to subsetting chapters list for the findings chapter. f
+
+```{r Findings Function}
+split_findings <- list()
+findings_by_q <- list()
+
+chapters_findings <- list()
+for (i in 1:length(reports)) {
+  chapters_findings[[paste("report",i)]] <- chapters[[i]]$findings
+}
+```
+
+
+Always filter stop words,numbers, & look at word stems for comparison. 
+```{r Locating Target Words}
+key_words <- list()
+
+#get words from indicators
+indicators <- data.frame("indicator" = removePunctuation(indicators$`Indicator Name`))
+indicator_stem <- data.frame("stem" = c(unlist(str_split(tolower(unlist(lapply(indicators,stem_strings)))," ")),stem_words(development_words)))
+
+#get a count of all words in the document
+for (i in 1:length(reports)) {
+  text <- reports[[i]]
+  tib <- tibble(words = text)
+  tok <- unnest_tokens(tib,word,words,token = "words")
+  tok_fil <- anti_join(tok,stop_words)
+  tok_fil <- tok_fil %>% filter(! word %in% (1:3000))
+  tok_fil["stem"] <- stem_words(tok_fil$word)
+  tok_count <- count(tok_fil,stem,sort = T)
+  
+  #get words from evaluation questions
+  text <- unlist(eval_questions[[i]])
+  tib <- tibble(words = text)
+  tok <- unnest_tokens(tib,word,words,token = "words")
+  tok_q <- anti_join(tok,stop_words)
+  tok_q <- tok_q %>% filter(!word %in% (1:3000)) %>% filter(!word %in% USAID_stops)
+  tok_q["stem"] <- stem_words(tok_q$word)
+  
+  #first check for words in the indicators
+  q_indicators <- unique(tok_q[which(tok_q$stem %in% indicator_stem$stem),])
+  final_key <- unique(tok_q[which(tok_q$stem %in% indicator_stem$stem & tok_q$stem %in% filter(tok_count,n > length(reports[[i]])/3)$stem),1])
+  
+  #A final filter. This narrows words to nouns & adjectives which was shown to be accurate.
+  x <- udpipe_annotate(ud_model, x = final_key[[1]])
+  x <- as.data.frame(x)
+  x_final <- x %>% filter(x$upos == "NOUN" | x$upos == "ADJ")
+  key_words[[report_names[i]]] <- unique(x_final$token)
+}
+key_subjects <- unique(unlist(key_words))
+selected_key_words <- key_word_selector(key_words)
+```
+
+Use some functions and get objects
+```{r}
+
+### this is stupid and I will fix this, but I will remove eventually. First run key_sentences, then run all tables section. Finally run key_sentences one more time
+
+key_sentences_ <- list() ### this is not the final key_sentences
+for (i in 1:length(chapters_findings)) {
+  name <- paste("Report", i)
+  key_sentences_[[name]] <- sentence_extraction_(chapters_findings[[i]],selected_key_words[[i]],2)
+}
+
+### find all tables in a report and remove them this takes a while do not be worried
+
+all_tables <- list()
+for(i in 1:length(reports_files)){
+  name <- paste("Report",i , "tables")
+  tables <- table_extract_char(reports_files[[i]])
+  all_tables[[name]] <- table_remover(key_sentences_[[i]], tables, 0.95)
+}
+  
+
+
+#Find each sentence with a key_word in it in the Findings chapter
+
+key_sentences <- list()
+for (i in 1:length(chapters_findings)) {
+  name <- paste("Report", i)
+  key_sentences[[name]] <- sentence_extraction(chapters_findings[[i]],selected_key_words[[i]],2, all_tables[[i]])
+}
+
+  
+
+
+#Get the sentiment score of the findings section for each key word and then score the key words overall. 
+key_grades <- list()
+report_grades <- list()
+
+for (i in 1:length(reports)) {
+  key_grades[[paste("report",i)]] <- find_sentiments(list(key_sentences[[i]]),afinn_edited,contradictions)[[1]]
+  report_grades[[paste("report",i)]] <- grader(list(key_grades[[i]]))
+}
+
+
+#enter the groups here. the format should be a list of groups.  
+# groups <- grouper(selected_key_words)
+# group_grades <- list()
+# for (i in 1:length(groups)) {
+#     group_grades[[report_names[i]]] <- group_grader(report_grades[[i]],groups[[i]])
+# }
+
+report_grades
+# group_grades
+```
+
+Author baseline in report
+```{r}
+all_author_baseline_df <- list()
+
+for(report in 1:length(reports)){
+  all_chapters <- chapters[[report]]
+  net_score <- c()
+  count_pos <- c()
+  count_neg <- c()
+  report_name <- report_names[[report]]
+  print(report_name)
+  
+  author_baseline_df <- c()
+  section_rating <- c()
+  
+  section_name <- c()
+  
+  for (chapter in 1:length(all_chapters)){
+
+    section <- all_chapters[[chapter]]
+
+    section_name <- c(section_name, all_chapters[[chapter]])
+    
+    section_rating <- text_rating(section, afinn_edited, contradictions)
+    
+    net_score <- c(net_score, section_rating["net_score",])
+    count_pos <- c(count_pos, section_rating["count_pos",])
+    count_neg <- c(count_neg, section_rating["count_neg",])
+    section_rating <- c(net_score/(count_pos + count_neg))
+    
+  } 
+  ### scrape just the exec summary, bground and eval questions
+ 
+  
+  author_baseline_df <- data.frame( net_score, count_pos, count_neg, section_rating)
+
+  totals_auth_baseline <- c(sum(net_score),sum(count_pos),sum(count_neg), sum(net_score)/(sum(count_pos) +sum(count_neg)))
+
+  author_baseline_df[nrow(author_baseline_df) + 1,] <- totals_auth_baseline
+  
+  
+
+  all_author_baseline_df[[paste('report', report)]] <-  author_baseline_df
+}
+
+
+
+###
+# 1-executive summary
+# 2-evaluation purpose and questions
+# 3- background
+# 4 - Methods and limitations
+# 5 - findings
+# 6- conclusions
+# 7 - recommendations
+# 8 - annex 
+# 9 - statement of work
+# 10- 
+
+
+
+
+```
+
+
+```{r}
+
+chapters_conclusion <- list()
+for (i in 1:length(reports)) {
+  chapters_conclusion[[paste("report",i)]] <- chapters[[i]]$conclusions
+}
+
+key_sentences_ <- list() ### this is not the final key_sentences
+for (i in 1:length(chapters_conclusion)) {
+  name <- paste("Report", i)
+  key_sentences_[[name]] <- sentence_extraction_(chapters_conclusion[[i]],selected_key_words[[i]],2)
+}
+  
+
+### find all tables in a report and remove them this takes a while do not be worried
+
+# all_tables <- list()
+# for(i in 1:length(reports_files)){
+#   name <- paste("Report",i , "tables")
+#   tables <- table_extract_char(reports_files[[i]])
+#   all_tables[[name]] <- table_remover(key_sentences_[[i]], tables, 0.95)
+# }
+  
+
+
+#Find each sentence with a key_word in it in the Findings chapter
+
+# key_sentences <- list()
+# for (i in 1:length(chapters_conclusion)) {
+#   name <- paste("Report", i)
+#   key_sentences[[name]] <- sentence_extraction(chapters_conclusion[[i]],selected_key_words[[i]],2, all_tables[[i]])
+# }
+
+  
+
+
+#Get the sentiment score of the findings section for each key word and then score the key words overall. 
+key_grades_conc <- list()
+report_grades_conc <- list()
+
+for (i in 1:length(reports)) {
+  key_grades_conc[[paste("report",i)]] <- find_sentiments(list(key_sentences_[[i]]),afinn_edited,contradictions)[[1]]
+  report_grades_conc[[paste("report",i)]] <- grader(list(key_grades[[i]]))
+}
+
+
+
+```
